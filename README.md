@@ -17,13 +17,13 @@ Pipeline:
   - Wm is the correlating weight table.
 
 + Training Algorithm 3 :
-  Input:
+  - Input:
     BST - Branch Status Table
-  Ouput:
+  - Ouput:
     W_b, W_m, W_rs, RS, updated GHR
 
 + BF-Neural Prediction Algorithm 2
-  Input:
+  - Input:
     BST, W_b, W_m, W_rs,RS, GHR, A
-   Output:
+  - Output:
     prediction: taken ? not_taken
