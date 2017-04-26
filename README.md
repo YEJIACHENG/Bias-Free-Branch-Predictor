@@ -12,6 +12,8 @@ Pipeline:
 
 + A: array of address of the non-biased branches
 
++ P: The absolute distance in the past global history of corresponding non-biased branches included in array A. P captures the pos hist of the non-biased branches present in the RS.
+
 + Wb, Wm: one-dimensional and two-dimensional arrays of integer weights respectively. 
   - Wb is the bias weight table,
   - Wm is the correlating weight table.
