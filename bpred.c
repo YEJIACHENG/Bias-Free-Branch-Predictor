@@ -1,5 +1,5 @@
 /* bpred.c - branch predictor routines */
-
+ 
 /* SimpleScalar(TM) Tool Suite
  * Copyright (C) 1994-2003 by Todd M. Austin, Ph.D. and SimpleScalar, LLC.
  * All Rights Reserved. 
@@ -59,6 +59,55 @@
 #include "machine.h"
 #include "bpred.h"
 
+#include <unistd.h>  
+
+/*******************************************************
+ * This structure is used by perceptron to simulate    *
+ * hardware behaviour				       *		
+ * It is hold by the bpred_update_t structure in field *
+ * "pdir1" thinking that is of type "char *".          *
+ * a casting is needed before beeing used              *
+ *******************************************************/
+typedef struct {
+	char dummy;      /* is holding the prediction instead of pdir1 */
+	int prediction;  /* prediction: 1 for taken, 0 for not taken   */
+	int output;      /* perceptron output                          */
+	
+	unsigned long long int 	history; /* value of the history register yielding this prediction */
+	int *weights_table_entry; /* entry of this perceptron in weights_table */
+
+	/* weights selection parameters */
+	int *masks_table_entry;   /* entry of this perceptron in mask_table  */
+	unsigned long long *counter_entry; /* how many times this perceptron is accessed */	
+	unsigned long long *counter_limit;
+	int selectWeightsFlag;		/* if this flag is 1, weights selection algorithm is on  */		
+} prcpt_update_t;
+
+
+/* if flag GET_WEIGHTS_STATS = 1, the stats file will contain weights table values a
+   following each preditcion */
+FILE* stats;
+#define GET_WEIGHTS_STATS               0      /* to be modified to 0 on  normal runs */
+
+/* maximum and minimum weight based on nr of available bits */
+#define MAX_WEIGHT(weight_bits)		((1<<((weight_bits)-1))-1)
+#define MIN_WEIGHT(weight_bits)		(-((MAX_WEIGHT(weight_bits))+1))
+
+/* threshold for perceptron training */
+#define THETA(prcpt_history)		((int) (1.93 * (prcpt_history) + 14))
+
+/*weights selection flags */
+#define START_IMPROVED_ALGORITHM        -1    /*  Branch visits until weight selection
+						if negative, will not select weights */
+#define USE                             1
+#define NOT_USE                         0
+
+/********************************************************************/
+
+
+
+void makeWeightsSelection(prcpt_update_t *prcpt,int numWeights);
+
 /* turn this on to enable the SimpleScalar 2.0 RAS bug */
 /* #define RAS_BUG_COMPATIBLE */
 
@@ -103,6 +152,13 @@ bpred_create(enum bpred_class class,	/* type of predictor to create */
       bpred_dir_create(class, l1size, l2size, shift_width, xor);
 
     break;
+    
+  case BPredPerceptron:
+    pred->dirpred.bimod =
+      bpred_dir_create(class, bimod_size, l1size, shift_width, 0);   
+      /* knowing history register width and perceptron table size must be enought */
+
+    break;
 
   case BPred2bit:
     pred->dirpred.bimod = 
@@ -122,8 +178,20 @@ bpred_create(enum bpred_class class,	/* type of predictor to create */
   case BPredComb:
   case BPred2Level:
   case BPred2bit:
+  case BPredPerceptron:
     {
       int i;
+
+      if(class == BPredPerceptron && GET_WEIGHTS_STATS)
+      {	
+	unlink("stats");
+      	stats = fopen("stats", "wa");
+	if(stats == NULL)
+	{
+		fatal("Couldn't open the stats file");
+	}
+      }	 
+	
 
       /* allocate BTB */
       if (!btb_sets || (btb_sets & (btb_sets-1)) != 0)
@@ -251,6 +319,44 @@ bpred_dir_create (
 
     break;
 
+  case BPredPerceptron:
+    if (!l1size)
+	  fatal("number of perceptrons, `%d', must be non-zero and positive",
+	    l1size);
+	if (!l2size)
+	  fatal("number of weight bits, `%d', must be non-zero and positive",
+	    l2size);
+	if (!shift_width)
+	  fatal("shift register width, `%d', must be non-zero and positive",
+	    shift_width);
+	
+	pred_dir->config.BF_neural.num_prcpt = l1size;
+	pred_dir->config.BF_neural.weight_bits = l2size;
+	pred_dir->config.BF_neural.prcpt_history = shift_width;
+	pred_dir->config.BF_neural.glbl_history = 0;
+        pred_dir->config.BF_neural.spc_glbl_history = 0;
+
+    if (!(pred_dir->config.BF_neural.weights_table =
+	  calloc(l1size, sizeof(int)*(shift_width+1))))
+	  fatal("cannot allocate perceptrons storage");
+
+     if (!(pred_dir->config.BF_neural.masks_table =
+          calloc(l1size, sizeof(int)*(shift_width+1))))
+          fatal("cannot allocate perceptrons masks");
+      
+     if (!(pred_dir->config.BF_neural.counters_table =
+          calloc(l1size, sizeof(unsigned long long))))
+          fatal("cannot allocate perceptrons masks");
+         
+     /* all the weights are initialized to 0 for every perceptron */
+     /* all the masks are initialized to USE */
+     for (cnt = 0; cnt < l1size*(shift_width+1); cnt++){
+        pred_dir->config.BF_neural.masks_table[cnt] = USE;
+     }
+
+
+    break;
+
   case BPredTaken:
   case BPredNotTaken:
     /* no other state */
@@ -281,6 +387,12 @@ bpred_dir_config(
   case BPred2bit:
     fprintf(stream, "pred_dir: %s: 2-bit: %d entries, direct-mapped\n",
       name, pred_dir->config.bimod.size);
+    break;
+
+ case BPredPerceptron:
+    fprintf(stream, "pred_dir: %s:  %d perceptrons, %d weight_bits, %d history\n",
+      name, pred_dir->config.BF_neural.num_prcpt, pred_dir->config.BF_neural.weight_bits,
+	  pred_dir->config.BF_neural.prcpt_history);
     break;
 
   case BPredTaken:
@@ -325,6 +437,13 @@ bpred_config(struct bpred_t *pred,	/* branch predictor instance */
     fprintf(stream, "ret_stack: %d entries", pred->retstack.size);
     break;
 
+  case BPredPerceptron:
+	bpred_dir_config (pred->dirpred.bimod, "BF_neural", stream); 
+    fprintf(stream, "btb: %d sets x %d associativity", 
+	    pred->btb.sets, pred->btb.assoc);
+    fprintf(stream, "ret_stack: %d entries", pred->retstack.size);	
+	break;
+
   case BPredTaken:
     bpred_dir_config (pred->dirpred.bimod, "taken", stream);
     break;
@@ -366,6 +485,9 @@ bpred_reg_stats(struct bpred_t *pred,	/* branch predictor instance */
       break;
     case BPred2bit:
       name = "bpred_bimod";
+      break;
+    case BPredPerceptron:
+      name = "bpred_BF_neural";
       break;
     case BPredTaken:
       name = "bpred_taken";
@@ -487,6 +609,11 @@ bpred_after_priming(struct bpred_t *bpred)
   ((((ADDR) >> 19) ^ ((ADDR) >> MD_BR_SHIFT)) & ((PRED)->config.bimod.size-1))
     /* was: ((baddr >> 16) ^ baddr) & (pred->dirpred.bimod.size-1) */
 
+#define BF_neural_HASH(PRED, ADDR)                                          \
+  ((((ADDR) >> 19) ^ ((ADDR) >> MD_BR_SHIFT)) & ((PRED)->config.BF_neural.num_prcpt-1))
+ 
+
+
 /* predicts a branch direction */
 char *						/* pointer to counter */
 bpred_dir_lookup(struct bpred_dir_t *pred_dir,	/* branch dir predictor inst */
@@ -533,6 +660,67 @@ bpred_dir_lookup(struct bpred_dir_t *pred_dir,	/* branch dir predictor inst */
     case BPred2bit:
       p = &pred_dir->config.bimod.table[BIMOD_HASH(pred_dir, baddr)];
       break;
+    case BPredPerceptron:
+		{
+			/***************************************************************
+			perceptron lookup algorithm
+			***************************************************************/
+
+			int	index, i, output, *w;
+			unsigned long long int  mask;
+			int *entry;
+			int*   masks_entry;
+                        unsigned long long *counters_entry;
+
+			prcpt_update_t* pred_state;
+
+			index = BF_neural_HASH(pred_dir, baddr); /* (baddr % pred_dir->config.BF_neural.num_prcpt)/8; */
+
+			/* get pointers to that perceptron and its weights */
+			entry = &pred_dir->config.BF_neural.weights_table[index*(pred_dir->config.BF_neural.prcpt_history+1)];
+			masks_entry = 
+                          &pred_dir->config.BF_neural.masks_table[index*(pred_dir->config.BF_neural.prcpt_history +1)];
+                        counters_entry = &pred_dir->config.BF_neural.counters_table[index];
+
+			*counters_entry = *counters_entry + 1;
+			
+			w = &entry[0];
+
+			/* bias first */
+			if(masks_entry[0] == USE)
+                                output = *w;
+                        else    output  = 0;
+
+			w++;
+			for (mask=1,i=1; i<=pred_dir->config.BF_neural.prcpt_history; i++,mask<<=1,w++) 
+			{
+			    if(masks_entry[i]==USE){
+				if (pred_dir->config.BF_neural.spc_glbl_history & mask)
+					output += *w;
+				else
+					output += -*w;
+			    }
+			}
+
+			/* record the various values needed to update the predictor */
+			
+			if (!(pred_state = calloc(1, sizeof(prcpt_update_t))))
+				fatal("cannot allocate perceptron_update storage");
+			pred_state->output = output;
+			pred_state->weights_table_entry = entry;
+			pred_state->masks_table_entry = masks_entry;
+			pred_state->counter_entry=counters_entry;
+			pred_state->history = pred_dir->config.BF_neural.spc_glbl_history;
+			pred_state->prediction = output >= 0;
+			pred_state->dummy = pred_state->prediction ? 3 : 0;
+			pred_state->selectWeightsFlag=(*counters_entry == START_IMPROVED_ALGORITHM) ? 1 : 0; 
+
+			/* update the speculative global history register */
+			pred_dir->config.BF_neural.spc_glbl_history <<= 1;
+			pred_dir->config.BF_neural.spc_glbl_history |= pred_state->prediction;
+			p = (char*)pred_state;                 /* :) */
+		}
+	  break;
     case BPredTaken:
     case BPredNotTaken:
       break;
@@ -610,6 +798,7 @@ bpred_lookup(struct bpred_t *pred,	/* branch predictor instance */
 	}
       break;
     case BPred2bit:
+    case BPredPerceptron:
       if ((MD_OP_FLAGS(op) & (F_CTRL|F_UNCOND)) != (F_CTRL|F_UNCOND))
 	{
 	  dir_update_ptr->pdir1 =
@@ -913,17 +1102,146 @@ bpred_update(struct bpred_t *pred,	/* branch predictor instance */
 
   /* update state (but not for jumps) */
   if (dir_update_ptr->pdir1)
-    {
+    {	
+	  if(pred->class == BPredPerceptron)
+	  {
+		/*************************************************************
+			Bias free training the perceptron 
+			
+			
+		*************************************************************/
+		
+
+        prcpt_update_t *u = (prcpt_update_t *) dir_update_ptr->pdir1;
+		int	i, y, *w,*m;
+		unsigned long long int mask, history;
+		int needUpdate = 1;
+	
+		/* update the real global history shift register */
+		pred->dirpred.bimod->config.BF_neural.glbl_history <<= 1;
+		pred->dirpred.bimod->config.BF_neural.glbl_history |= taken;
+
+		/* if this branch was mispredicted, restore the speculative
+		 * history to the last known real history
+		 */
+		if (u->prediction != taken) 
+			pred->dirpred.bimod->config.BF_neural.spc_glbl_history = 
+			pred->dirpred.bimod->config.BF_neural.glbl_history;
+
+		/* if the output of the perceptron predictor is outside of
+		 * the range [-THETA,THETA] and the prediction was correct,
+		 * then we don't need to adjust the weights
+	     	*/
+		if (u->output > THETA(pred->dirpred.bimod->config.BF_neural.prcpt_history))
+			y = 1;
+		else if (u->output < -THETA(pred->dirpred.bimod->config.BF_neural.prcpt_history))
+			y = 0;
+		else
+			y = 2;
+
+		if (y == 1 && taken) needUpdate--;
+		if (y == 0 && !taken) needUpdate--;
+
+		if (u->selectWeightsFlag)
+        	{
+            		if(GET_WEIGHTS_STATS)
+            		{
+				fprintf (stats,"%5d %5llu    _Entering weights selection.",
+						(int)BF_neural_HASH(pred->dirpred.bimod, baddr),
+                        			*(u->counter_entry));
+			}
+			makeWeightsSelection(u,pred->dirpred.bimod->config.BF_neural.prcpt_history);
+			if(GET_WEIGHTS_STATS)
+            		{
+				fprintf (stats,"\n");
+			}
+		}
+		/* training needed */
+		if(needUpdate)
+		{
+			/* w is a pointer to the first weight (the bias weight) */
+			w = &u->weights_table_entry[0];
+			m = &u->masks_table_entry[0];
+
+			/* if the branch was taken, increment the bias weight,
+		 	* else decrement it, with saturating arithmetic
+		 	*/
+			if (*m)
+			{
+				if (taken)
+					(*w)++;
+				else
+					(*w)--;
+			}
+			if (*w > MAX_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits)) *w = 
+				MAX_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits);
+			if (*w < MIN_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits)) *w = 
+				MIN_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits);
+
+			/* now w points to the next weight */
+			w++;
+			m++;
+
+			/* get the history that led to this prediction */
+			history = u->history;
+
+			/* for each weight and corresponding bit in the history register... */
+			for (mask=1,i=0; i<pred->dirpred.bimod->config.BF_neural.prcpt_history; i++,mask<<=1,w++,m++) 
+ 			{
+
+				/* if the i'th bit in the history positively correlates
+			 	* with this branch outcome, increment the corresponding 
+			 	* weight, else decrement it.
+			 	*/
+				if (*m)
+				{
+					if (!!(history & mask ) == taken) 
+                                        {
+					  (*w)++;
+					  if (*w > MAX_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits)) 
+                                            *w = MAX_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits);
+					} 
+                                        else 
+					{
+					  (*w)--;
+					  if (*w < MIN_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits)) 
+					    *w = MIN_WEIGHT(pred->dirpred.bimod->config.BF_neural.weight_bits);
+					}
+				}
+			}
+
+			/* if printing perceptron weights is needed */
+			if(GET_WEIGHTS_STATS)
+			{
+				char line[200]={0};
+				char temp[200];
+				int index = BF_neural_HASH(pred->dirpred.bimod, baddr); 	
+				sprintf(temp, "%5d %5llu %10p %3d",  index,
+					*(u->counter_entry)
+					/*pred->dirpred.bimod->config.BF_neural.counters_table[index]*/
+					, (void *)baddr, u->prediction );
+				strcat(line,temp);
+				for(i=0; i<=pred->dirpred.bimod->config.BF_neural.prcpt_history; i++)
+				{
+					sprintf(temp, "%5d ",u->weights_table_entry[i] );
+					strcat(line,temp);
+				}
+				sprintf(temp, "\n");
+				strcat(line,temp);
+				fprintf(stats,line);
+			}
+		}
+
+	  }
       if (taken)
-	{
-	  if (*dir_update_ptr->pdir1 < 3)
-	    ++*dir_update_ptr->pdir1;
-	}
-      else
-	{ /* not taken */
-	  if (*dir_update_ptr->pdir1 > 0)
-	    --*dir_update_ptr->pdir1;
-	}
+	  {
+		if (*dir_update_ptr->pdir1 < 3)
+			++*dir_update_ptr->pdir1;
+	  } else
+		{ /* not taken */
+			if (*dir_update_ptr->pdir1 > 0)
+			--*dir_update_ptr->pdir1;
+	  }
     }
 
   /* combining predictor also updates second predictor and meta predictor */
@@ -982,4 +1300,26 @@ bpred_update(struct bpred_t *pred,	/* branch predictor instance */
 	  pbtb->target = btarget;
 	}
     }
+}
+
+void makeWeightsSelection(prcpt_update_t *prcpt,int numWeights)
+{
+	/* unenabling 1/2 minimal weights */
+	int k;
+	for (k=0;k<(numWeights+1)*1/2;k++) /* includes the biased weight) */ 
+	{
+		int i=0;
+		int tmp;
+		for (;i<=numWeights && prcpt->masks_table_entry[i]==0;i++); //find first weight
+		tmp=i;
+		for (i++;i<=numWeights;i++) /* includes the biased weight) */
+		  if(prcpt->masks_table_entry[i] 
+                      && (abs(prcpt->weights_table_entry[i])<abs(prcpt->weights_table_entry[tmp])))
+				tmp=i;
+		prcpt->masks_table_entry[tmp]=0;
+		if(GET_WEIGHTS_STATS)
+                {
+		  fprintf (stats," %d",tmp);
+		}
+	}	
 }

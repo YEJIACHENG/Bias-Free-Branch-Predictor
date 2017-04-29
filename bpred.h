@@ -1,5 +1,5 @@
 /* bpred.h - branch predictor interfaces */
-
+  
 /* SimpleScalar(TM) Tool Suite
  * Copyright (C) 1994-2003 by Todd M. Austin, Ph.D. and SimpleScalar, LLC.
  * All Rights Reserved. 
@@ -91,6 +91,12 @@
  *		are incremented on taken branches and decremented on
  *		no taken branches.  One BTB entry per counter.
  *
+ *
+ *	BPredPerceptron: a perceptron based predictor
+ *		
+ *		Parameters are:
+ *		<nr_of_perceptrons> <nr_of_weight_bits> <history_length>
+ * 
  *	BPredTaken:  static predict branch taken
  *
  *	BPredNotTaken:  static predict branch not taken
@@ -104,6 +110,7 @@ enum bpred_class {
   BPred2bit,			/* 2-bit saturating cntr pred (dir mapped) */
   BPredTaken,			/* static predict taken */
   BPredNotTaken,		/* static predict not taken */
+  BPredPerceptron,		/* perceptron predictor */
   BPred_NUM
 };
 
@@ -131,6 +138,17 @@ struct bpred_dir_t {
       int *shiftregs;		/* level-1 history table */
       unsigned char *l2table;	/* level-2 prediction state table */
     } two;
+	
+	struct {
+	  int num_prcpt;		/* number   of perceptrons */
+	  int weight_bits;    		/* number of bits per weight */
+	  int prcpt_history; 		/* history length for the global history shift register */
+	  int *weights_table;		/* every entry is an array of weights, a perceptron */	
+	  int *masks_table;		/* only the masked weigths are calculated */
+	  unsigned long long *counters_table;	/* how many times each perceptron is accessed */
+	  unsigned long long glbl_history;	/* global history of branches */
+	  unsigned long long spc_glbl_history;	/* speculative history of branches */
+	} BF_neural;
   } config;
 };
 
